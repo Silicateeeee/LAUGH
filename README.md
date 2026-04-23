@@ -51,3 +51,14 @@ Main UI
 
 Finished Scan + Address List
 <img width="764" height="746" alt="image" src="https://github.com/user-attachments/assets/346c4eed-29a9-4ad4-83f4-d3a7688e2622" />
+
+Settings UI
+
+General Settings
+<img width="303" height="117" alt="image" src="https://github.com/user-attachments/assets/7e504d23-ce70-4f68-92a7-259aa2fcfe07" />
+
+Scanner Settings
+<img width="205" height="179" alt="image" src="https://github.com/user-attachments/assets/5ff0f15c-5d87-4f68-83c8-9d8df2dab786" />
+
+Visual Settings(UI Scale is a lil jank deal with it)
+<img width="282" height="120" alt="image" src="https://github.com/user-attachments/assets/b36f13dc-e037-473a-9855-5ab0021e8273" />
