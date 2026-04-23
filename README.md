@@ -49,7 +49,9 @@ You do need sudo to run it
 ### Main UI
 <img width="723" height="743" alt="Screenshot_20260423_123816" src="https://github.com/user-attachments/assets/43a8de0c-2330-4341-a637-45bad685afe8" />
 
+
 Finished Scan + Address List
+
 <img width="764" height="746" alt="image" src="https://github.com/user-attachments/assets/346c4eed-29a9-4ad4-83f4-d3a7688e2622" />
 
 ### Settings UI
