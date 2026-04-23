@@ -401,7 +401,7 @@ int main(int, char**) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    GLFWwindow* window = glfwCreateWindow(1280, 720, "Lince", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "LAUGH", NULL, NULL);
     if (window == NULL) return 1;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
