@@ -130,26 +130,21 @@ const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
 void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, uint32_t targetVal, float targetFloat, const std::string& targetStr, std::vector<ScanResult>& localResults) {
     size_t regionSize = region.end - region.start;
     
-    // Determine number of threads to use for parallel chunk processing within this region
     unsigned int numThreads = std::thread::hardware_concurrency();
     if (numThreads == 0) {
-        numThreads = 4; // Default to 4 if hardware_concurrency() is not available
+        numThreads = 4;
     }
     
-    // Calculate total number of 1MB chunks in the region
     size_t totalChunks = (regionSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
     
-    // If the region is too small, or we don't have enough chunks/threads to make parallelization worthwhile, scan sequentially.
-    if (numThreads <= 1 || totalChunks < numThreads * 2) { // Heuristic: only parallelize if at least 2 chunks per thread
-        std::vector<uint8_t> buffer(CHUNK_SIZE + 8); // Buffer for reading chunks
+    if (numThreads <= 1 || totalChunks < numThreads * 2) {
+        std::vector<uint8_t> buffer(CHUNK_SIZE + 8); 
         for (size_t offset = 0; offset < regionSize; offset += CHUNK_SIZE) {
             size_t bytesToRead = std::min(CHUNK_SIZE, regionSize - offset);
-            // Read one extra byte so we can check the null terminator for strings
             size_t readSize = std::min(bytesToRead + 1, regionSize - offset);
             if (readRaw(region.start + offset, buffer.data(), readSize) > 0) {
-                // Determine the size of the value we are searching for
                 size_t valSize = (type == ValueType::String) ? targetStr.length() : 4;
-                if (bytesToRead < valSize) continue; // Not enough bytes in this chunk to contain the value
+                if (bytesToRead < valSize) continue; 
 
                 for (size_t i = 0; i <= bytesToRead - valSize; ++i) {
                     bool match = false;
@@ -163,10 +158,8 @@ void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, u
                         if (val == targetFloat) match = true;
                     } else if (type == ValueType::String) {
                         if (std::memcmp(&buffer[i], targetStr.c_str(), targetStr.length()) == 0) {
-                            // Exact match only: the byte immediately after must be a null terminator.
-                            // This prevents "[FeedbackTool]" matching "[FeedbackTool](Clone)".
                             size_t afterIdx = i + targetStr.length();
-                            if (afterIdx >= readSize || buffer[afterIdx] == '\0') { // Fixed multi-character literal
+                            if (afterIdx >= readSize || buffer[afterIdx] == '\0') { 
                                 match = true;
                             }
                         }
@@ -178,10 +171,9 @@ void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, u
                 }
             }
         }
-        return; // Sequential scan done
+        return;
     }
 
-    // Parallel processing for large regions
     std::vector<std::future<std::vector<ScanResult>>> futures;
     size_t subChunkSize = totalChunks / numThreads;
     size_t remainder = totalChunks % numThreads;
@@ -191,29 +183,22 @@ void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, u
         size_t chunksForThisThread = subChunkSize + (i < remainder ? 1 : 0);
         size_t startOffset = currentOffset;
         size_t endOffset = startOffset + chunksForThisThread * CHUNK_SIZE;
-        // Ensure endOffset does not exceed regionSize
         endOffset = std::min(endOffset, regionSize); 
         
-        if (startOffset >= endOffset) continue; // Skip if no work for this thread
+        if (startOffset >= endOffset) continue;
 
-        // Capture regionSize explicitly
         futures.push_back(std::async(std::launch::async, [this, region, regionSize, type, targetVal, targetFloat, targetStr, startOffset, endOffset]() {
             std::vector<ScanResult> threadLocalResults;
             size_t currentOffsetInThread = startOffset;
-            // Buffer size for reading chunks. Add CHUNK_SIZE for the actual chunk, and 8 for safety/string null check.
             std::vector<uint8_t> buffer(CHUNK_SIZE + 8); 
 
             while(currentOffsetInThread < endOffset) {
-                // Determine the size of data to read for the current chunk, ensuring we don't read past the region's end.
-                // Add 1 for potential string null terminator check.
                 size_t bytesToRead = std::min(CHUNK_SIZE, endOffset - currentOffsetInThread);
-                // Use captured regionSize here.
                 size_t readSize = std::min(bytesToRead + 1, regionSize - currentOffsetInThread); 
 
                 if (readRaw(region.start + currentOffsetInThread, buffer.data(), readSize) > 0) {
-                    // Determine the size of the value we are searching for
                     size_t valSize = (type == ValueType::String) ? targetStr.length() : 4;
-                    if (bytesToRead < valSize) continue; // Not enough bytes in this chunk to contain the value
+                    if (bytesToRead < valSize) continue;
 
                     for (size_t i = 0; i <= bytesToRead - valSize; ++i) {
                         bool match = false;
@@ -227,9 +212,7 @@ void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, u
                             if (val == targetFloat) match = true;
                         } else if (type == ValueType::String) {
                             if (std::memcmp(&buffer[i], targetStr.c_str(), targetStr.length()) == 0) {
-                                // Exact match only: the byte immediately after must be a null terminator.
                                 size_t afterIdx = i + targetStr.length();
-                                // Fixed multi-character literal, use '\0'
                                 if (afterIdx >= readSize || buffer[afterIdx] == '\0') { 
                                     match = true;
                                 }
@@ -241,14 +224,13 @@ void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, u
                         }
                     }
                 }
-                currentOffsetInThread += CHUNK_SIZE; // Move to the next chunk
+                currentOffsetInThread += CHUNK_SIZE;
             }
             return threadLocalResults;
         }));
-        currentOffset = endOffset; // Update offset for the next thread
+        currentOffset = endOffset;
     }
 
-    // Collect results from all threads
     for (auto& future : futures) {
         auto results = future.get();
         localResults.insert(localResults.end(), results.begin(), results.end());
@@ -315,7 +297,7 @@ void MemScanner::firstScan(ValueType type, const std::string& valueStr) {
 void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
     if (m_isScanning) return;
     m_isScanning = true;
-    m_progress = 0.0f; // Reset progress
+    m_progress = 0.0f;
 
     std::thread([this, type, valueStr]() {
         uint32_t targetVal = 0;
@@ -331,7 +313,7 @@ void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
         std::vector<ScanResult> currentResults;
         {
             std::lock_guard<std::mutex> lock(m_resultsMutex);
-            currentResults = m_results; // Make a copy to iterate over
+            currentResults = m_results;
         }
 
         if (currentResults.empty()) {
@@ -343,12 +325,10 @@ void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
         std::vector<ScanResult> newResults;
         std::vector<std::future<std::vector<ScanResult>>> futures;
 
-        // Determine number of threads
         unsigned int numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) {
-            numThreads = 4; // Default to 4 if hardware_concurrency() is not available
+            numThreads = 4;
         }
-        // Ensure we don't use more threads than results to check
         numThreads = std::min(numThreads, (unsigned int)currentResults.size());
         
         size_t chunkSize = currentResults.size() / numThreads;
@@ -359,7 +339,7 @@ void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
             size_t currentChunkSize = chunkSize + (i < remainder ? 1 : 0);
             size_t endIndex = startIndex + currentChunkSize;
 
-            if (currentChunkSize == 0) continue; // Skip if no work for this thread
+            if (currentChunkSize == 0) continue;
 
             futures.push_back(std::async(std::launch::async, [this, &currentResults, type, targetVal, targetFloat, valueStr, startIndex, endIndex]() {
                 std::vector<ScanResult> localResults;
@@ -373,11 +353,10 @@ void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
                         float val = readMemory<float>(res.address);
                         if (val == targetFloat) match = true;
                     } else if (type == ValueType::String) {
-                        // Read one extra byte so we can check the null terminator after the match.
                         std::string val = readString(res.address, valueStr.length() + 1);
                         if (val.length() >= valueStr.length() &&
                             val.substr(0, valueStr.length()) == valueStr &&
-                            (val.length() == valueStr.length() || val[valueStr.length()] == '\\0')) { // Escaped null terminator for string literal
+                            (val.length() == valueStr.length() || val[valueStr.length()] == '\\0')) {
                             match = true;
                         }
                     }
@@ -390,11 +369,9 @@ void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
             startIndex = endIndex;
         }
 
-        // Collect results and update progress
         for (size_t i = 0; i < futures.size(); ++i) {
             auto results = futures[i].get();
             newResults.insert(newResults.end(), results.begin(), results.end());
-            // Update progress based on how many futures have completed. This is a rough approximation.
             m_progress = (float)(i + 1) / futures.size(); 
         }
 
@@ -404,6 +381,6 @@ void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
         }
 
         m_isScanning = false;
-        m_progress = 1.0f; // Ensure progress is 100% upon completion
+        m_progress = 1.0f;
     }).detach();
 }
