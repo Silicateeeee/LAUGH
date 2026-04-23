@@ -8,7 +8,7 @@ SOURCES += $(IMGUI_DIR)/imgui.cpp $(IMGUI_DIR)/imgui_draw.cpp $(IMGUI_DIR)/imgui
 SOURCES += $(IMGUI_DIR)/backends/imgui_impl_glfw.cpp $(IMGUI_DIR)/backends/imgui_impl_opengl3.cpp
 
 OBJS = $(SOURCES:.cpp=.o)
-EXE = linuxce
+EXE = lince
 
 all: $(EXE)
 	@echo Build complete for $(EXE)
