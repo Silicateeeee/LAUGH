@@ -124,12 +124,57 @@ template bool MemScanner::writeMemory<uint64_t>(uintptr_t, uint64_t);
 template bool MemScanner::writeMemory<float>(uintptr_t, float);
 template bool MemScanner::writeMemory<double>(uintptr_t, double);
 
+struct AOBByte {
+    uint8_t value;
+    bool isWildcard;
+};
+
+static std::vector<AOBByte> parseAOB(const std::string& pattern) {
+    std::vector<AOBByte> bytes;
+    std::stringstream ss(pattern);
+    std::string hex;
+    while (ss >> hex) {
+        if (hex == "??" || hex == "?") {
+            bytes.push_back({0, true});
+        } else {
+            try {
+                bytes.push_back({(uint8_t)std::stoul(hex, nullptr, 16), false});
+            } catch (...) {}
+        }
+    }
+    return bytes;
+}
 
 const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
 
 void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, uint32_t targetVal, float targetFloat, const std::string& targetStr, std::vector<ScanResult>& localResults) {
     size_t regionSize = region.end - region.start;
     
+    if (type == ValueType::AOB) {
+        auto aob = parseAOB(targetStr);
+        if (aob.empty()) return;
+        
+        std::vector<uint8_t> buffer(CHUNK_SIZE + aob.size());
+        for (size_t offset = 0; offset < regionSize; offset += CHUNK_SIZE) {
+            size_t bytesToRead = std::min(CHUNK_SIZE, regionSize - offset);
+            size_t readSize = std::min(bytesToRead + aob.size() - 1, regionSize - offset);
+            if (readRaw(region.start + offset, buffer.data(), readSize) > 0) {
+                for (size_t i = 0; i < bytesToRead; ++i) {
+                    if (i + aob.size() > readSize) break;
+                    bool match = true;
+                    for (size_t j = 0; j < aob.size(); ++j) {
+                        if (!aob[j].isWildcard && buffer[i + j] != aob[j].value) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) localResults.push_back({region.start + offset + i});
+                }
+            }
+        }
+        return;
+    }
+
     unsigned int numThreads = std::thread::hardware_concurrency();
     if (numThreads == 0) {
         numThreads = 4;
@@ -249,6 +294,52 @@ bool MemScanner::writeString(uintptr_t address, const std::string& value) {
     return writeRaw(address, value.c_str(), value.length()) == (ssize_t)value.length();
 }
 
+std::vector<ScanResult> MemScanner::aobScan(const std::string& pattern) {
+    auto aob = parseAOB(pattern);
+    if (aob.empty()) return {};
+
+    auto regions = getRegions();
+    std::vector<std::future<std::vector<ScanResult>>> futures;
+
+    for (const auto& region : regions) {
+        futures.push_back(std::async(std::launch::async, [this, region, aob]() {
+            std::vector<ScanResult> local;
+            size_t regionSize = region.end - region.start;
+            std::vector<uint8_t> buffer(CHUNK_SIZE + aob.size());
+
+            for (size_t offset = 0; offset < regionSize; offset += CHUNK_SIZE) {
+                size_t bytesToRead = std::min(CHUNK_SIZE, regionSize - offset);
+                size_t readSize = std::min(bytesToRead + aob.size() - 1, regionSize - offset);
+                
+                if (readRaw(region.start + offset, buffer.data(), readSize) > 0) {
+                    for (size_t i = 0; i < bytesToRead; ++i) {
+                        if (i + aob.size() > readSize) break;
+                        
+                        bool match = true;
+                        for (size_t j = 0; j < aob.size(); ++j) {
+                            if (!aob[j].isWildcard && buffer[i + j] != aob[j].value) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            local.push_back({region.start + offset + i});
+                        }
+                    }
+                }
+            }
+            return local;
+        }));
+    }
+
+    std::vector<ScanResult> allResults;
+    for (auto& f : futures) {
+        auto res = f.get();
+        allResults.insert(allResults.end(), res.begin(), res.end());
+    }
+    return allResults;
+}
+
 void MemScanner::firstScan(ValueType type, const std::string& valueStr) {
     if (m_isScanning) return;
     m_isScanning = true;
@@ -262,10 +353,12 @@ void MemScanner::firstScan(ValueType type, const std::string& valueStr) {
         float targetFloat = 0.0f;
         try {
             if (type == ValueType::FourBytes) targetVal = (uint32_t)std::stoul(valueStr);
-            if (type == ValueType::Float) targetFloat = std::stof(valueStr);
+            else if (type == ValueType::Float) targetFloat = std::stof(valueStr);
         } catch (...) {
-            m_isScanning = false;
-            return;
+            if (type != ValueType::String && type != ValueType::AOB) {
+                m_isScanning = false;
+                return;
+            }
         }
 
         std::vector<std::future<std::vector<ScanResult>>> futures;
@@ -356,7 +449,7 @@ void MemScanner::nextScan(ValueType type, const std::string& valueStr) {
                         std::string val = readString(res.address, valueStr.length() + 1);
                         if (val.length() >= valueStr.length() &&
                             val.substr(0, valueStr.length()) == valueStr &&
-                            (val.length() == valueStr.length() || val[valueStr.length()] == '\\0')) {
+                            (val.length() == valueStr.length() || val[valueStr.length()] == '\0')) {
                             match = true;
                         }
                     }

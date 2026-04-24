@@ -3,16 +3,19 @@
 #include <string>
 #include <algorithm>
 #include <iomanip>
+#include <fstream>
+#include <sstream>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include <stdio.h>
 #define GL_SILENCE_DEPRECATION
-#include <GLFW/glfw3.h>
+#include "glfw3.h"
 
 #include "process.hpp"
 #include "mem_scanner.hpp"
+#include "jsruntime.hpp"
 
 bool processNameContains(const std::string& name, const std::string& filter);
 
@@ -21,6 +24,31 @@ std::vector<ProcessInfo> g_processes;
 ProcessInfo g_selectedProcess = {-1, "None", ""};
 bool g_showProcessSelector = false;
 bool g_showSettings = false;
+
+std::unique_ptr<laugh::JavaScriptEngine> g_jsEngine;
+bool g_showScriptPanel = false;
+char g_scriptCodeBuffer[32768] = "";
+char g_scriptPath[256] = "myscript.js";
+
+const char* DEFAULT_SCRIPT = R"(
+// Welcome to LAUGH JavaScript scripting!
+// Access memory with: memory.read(address, type)
+// memory.write(address, value, type)
+// memory.scan() - returns all addresses
+// Type: 0=byte, 1=2bytes, 2=4bytes, 3=8bytes, 4=float, 5=double, 6=string
+
+function onUpdate() {
+    // Your code here - called every frame
+}
+
+function onGUI() {
+    // Your custom GUI code here
+    gui.text("Script Panel loaded!");
+    if (gui.button("Click Me")) {
+        log("Button clicked!");
+    }
+}
+)";
 
 struct Settings {
     int alignment = 4;
@@ -53,7 +81,8 @@ struct EditState {
 
 char g_searchValue[128] = "100";
 int g_selectedType = 2;
-const char* g_types[] = { "Byte", "2 Bytes", "4 Bytes", "8 Bytes", "Float", "Double", "String" };
+const char* g_types[] = { "Byte", "2 Bytes", "4 Bytes", "8 Bytes", "Float", "Double", "String", "AOB" };
+
 static void SetEditBuffer(const char* str) {
     memset(g_editState.buffer, 0, sizeof(g_editState.buffer));
     snprintf(g_editState.buffer, sizeof(g_editState.buffer), "%s", str);
@@ -115,12 +144,6 @@ void DrawTopLeft() {
         ImGui::TableSetupColumn("Address");
         ImGui::TableSetupColumn("Value");
         ImGui::TableHeadersRow();
-
-        if (ImGui::IsWindowFocused() && ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyPressed(ImGuiKey_A)) {
-            for (const auto& res : results) {
-                g_savedAddresses.push_back({false, "No description", res.address, (ValueType)g_selectedType, "???"});
-            }
-        }
 
         for (size_t i = 0; i < std::min(results.size(), (size_t)1000); ++i) {
             ImGui::TableNextRow();
@@ -206,6 +229,10 @@ void DrawTopRight() {
     if (ImGui::Button("Settings")) {
         g_showSettings = true;
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Scripts")) {
+        g_showScriptPanel = true;
+    }
 
     ImGui::Separator();
 
@@ -227,6 +254,171 @@ void DrawTopRight() {
 
     ImGui::EndChild();
     ImGui::EndGroup();
+}
+
+void DrawDocumentation() {
+    ImGui::TextColored(ImVec4(1, 1, 0, 1), "LAUGH Scripting Documentation");
+    ImGui::Separator();
+
+    if (ImGui::BeginTabBar("DocTabs")) {
+        if (ImGui::BeginTabItem("Memory")) {
+            ImGui::Text("memory.read(address, type)");
+            ImGui::BulletText("address: BigInt or Number");
+            ImGui::BulletText("type: 0=Byte, 1=2Bytes, 2=4Bytes, 3=8Bytes, 4=Float, 5=Double, 6=String");
+            ImGui::Separator();
+            ImGui::Text("memory.write(address, value, type)");
+            ImGui::BulletText("value: Number or BigInt");
+            ImGui::Separator();
+            ImGui::Text("memory.scan()");
+            ImGui::BulletText("Returns an array of BigInt addresses from the last scan results.");
+            ImGui::Separator();
+            ImGui::Text("memory.AOB(pattern)");
+            ImGui::BulletText("pattern: String (e.g., \"00 FA AF ?? 00\")");
+            ImGui::BulletText("Returns an array of BigInt addresses found.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("GUI")) {
+            ImGui::Text("gui.button(label) - Returns true if clicked");
+            ImGui::Text("gui.text(text)");
+            ImGui::Text("gui.checkbox(label, value) - Returns new value");
+            ImGui::Text("gui.inputInt(label, value) - Returns new value");
+            ImGui::Text("gui.inputFloat(label, value) - Returns new value");
+            ImGui::Text("gui.sliderFloat(label, value, min, max) - Returns new value");
+            ImGui::Text("gui.sameLine()");
+            ImGui::Text("gui.separator()");
+            ImGui::Text("gui.beginWindow(name) / gui.endWindow()");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Hooks")) {
+            ImGui::Text("function onUpdate() { ... }");
+            ImGui::BulletText("Called every frame. Useful for background memory manipulation.");
+            ImGui::Separator();
+            ImGui::Text("function onGUI() { ... }");
+            ImGui::BulletText("Called during UI rendering. Use gui.* functions here.");
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+// Global JS window state
+GLFWwindow* g_jsOutputWindow = nullptr;
+ImGuiContext* g_jsOutputContext = nullptr;
+
+void InitJSOutputWindow(const char* glsl_version) {
+    if (g_jsOutputWindow) return;
+
+    glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+    g_jsOutputWindow = glfwCreateWindow(640, 480, "LAUGH Script Output", NULL, NULL);
+    if (!g_jsOutputWindow) return;
+
+    // Save current
+    GLFWwindow* main_win = glfwGetCurrentContext();
+    ImGuiContext* main_ctx = ImGui::GetCurrentContext();
+
+    glfwMakeContextCurrent(g_jsOutputWindow);
+    g_jsOutputContext = ImGui::CreateContext();
+    ImGui::SetCurrentContext(g_jsOutputContext);
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplGlfw_InitForOpenGL(g_jsOutputWindow, true);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
+    // Restore
+    glfwMakeContextCurrent(main_win);
+    ImGui::SetCurrentContext(main_ctx);
+}
+
+void DrawScriptPanel() {
+    if (!g_showScriptPanel) return;
+
+    ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Script Engine", &g_showScriptPanel)) {
+        if (ImGui::BeginTabBar("ScriptPanelTabs")) {
+            if (ImGui::BeginTabItem("Editor")) {
+                // Toolbar
+                if (ImGui::Button("Execute")) {
+                    g_jsEngine->execute(g_scriptCodeBuffer);
+                    if (!g_jsOutputWindow) {
+                        InitJSOutputWindow("#version 130");
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Open GUI Window")) {
+                    InitJSOutputWindow("#version 130");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset Runtime")) {
+                    g_jsEngine->init();
+                    g_jsEngine->setMemoryScanner(&g_scanner);
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputText("##path", g_scriptPath, IM_ARRAYSIZE(g_scriptPath));
+                ImGui::SameLine();
+                if (ImGui::Button("Load")) {
+                    std::ifstream t(g_scriptPath);
+                    if (t.is_open()) {
+                        std::stringstream buffer;
+                        buffer << t.rdbuf();
+                        std::string content = buffer.str();
+                        strncpy(g_scriptCodeBuffer, content.c_str(), sizeof(g_scriptCodeBuffer)-1);
+                        g_jsEngine->addLog(laugh::ScriptLog::Info, "Loaded script from " + std::string(g_scriptPath));
+                    } else {
+                        g_jsEngine->addLog(laugh::ScriptLog::Error, "Failed to open file: " + std::string(g_scriptPath));
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Save")) {
+                    std::ofstream t(g_scriptPath);
+                    if (t.is_open()) {
+                        t << g_scriptCodeBuffer;
+                        g_jsEngine->addLog(laugh::ScriptLog::Info, "Saved script to " + std::string(g_scriptPath));
+                    } else {
+                        g_jsEngine->addLog(laugh::ScriptLog::Error, "Failed to save file: " + std::string(g_scriptPath));
+                    }
+                }
+
+                ImGui::Separator();
+
+                // Editor and Log
+                float availH = ImGui::GetContentRegionAvail().y;
+                ImGui::InputTextMultiline("##code", g_scriptCodeBuffer, IM_ARRAYSIZE(g_scriptCodeBuffer),
+                    ImVec2(-1, availH * 0.7f), ImGuiInputTextFlags_AllowTabInput);
+
+                ImGui::Separator();
+                ImGui::Text("Console:");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear")) g_jsEngine->clearLogs();
+                
+                ImGui::BeginChild("ConsoleLog", ImVec2(0, 0), true);
+                for (const auto& log : g_jsEngine->getLogs()) {
+                    ImVec4 color(1, 1, 1, 1);
+                    if (log.level == laugh::ScriptLog::Error) color = ImVec4(1, 0.4f, 0.4f, 1);
+                    else if (log.level == laugh::ScriptLog::Warning) color = ImVec4(1, 1, 0.4f, 1);
+                    
+                    ImGui::TextDisabled("[%s]", log.timestamp.c_str());
+                    ImGui::SameLine();
+                    ImGui::TextColored(color, "%s", log.message.c_str());
+                }
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+                    ImGui::SetScrollHereY(1.0f);
+                ImGui::EndChild();
+
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Documentation")) {
+                DrawDocumentation();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+    }
+    ImGui::End();
 }
 
 void DrawEditPopups() {
@@ -263,22 +455,16 @@ void DrawEditPopups() {
                                 g_scanner.writeMemory<uint8_t>(addr.address + j, (uint8_t)g_editState.buffer[j]);
                             }
                             g_scanner.writeMemory<uint8_t>(addr.address + len, 0);
-                            printf("Successfully wrote string \"%s\" (%zu bytes + null) to address %p.\n",
-                                   g_editState.buffer, len, (void*)addr.address);
                         } else {
                             uint32_t val = (uint32_t)std::stoul(g_editState.buffer);
                             g_scanner.writeMemory<uint32_t>(addr.address, val);
-                            printf("Successfully wrote uint32_t value %u to address %p.\n", val, (void*)addr.address);
                         }
                     } else if (g_editState.field == EditField::Description) {
                         addr.description = g_editState.buffer;
-                        printf("Successfully updated description for address %p.\n", (void*)addr.address);
                     } else if (g_editState.field == EditField::Address) {
                         addr.address = std::stoull(g_editState.buffer, nullptr, 16);
-                        printf("Successfully updated address to %p.\n", (void*)addr.address);
                     }
                 } catch (...) {
-                    fprintf(stderr, "Error updating field %d. Please check input format and permissions.\n", (int)g_editState.field);
                 }
                 g_editState.field = EditField::None;
                 ImGui::CloseCurrentPopup();
@@ -311,11 +497,7 @@ void DrawBottom() {
             ImGui::PushID(i);
 
             ImGui::TableSetColumnIndex(0);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
-            ImGui::SetWindowFontScale(0.8f);
             ImGui::Checkbox("##active", &addr.active);
-            ImGui::SetWindowFontScale(1.0f);
-            ImGui::PopStyleVar();
 
             auto CellItem = [&](const char* label, EditField field, const char* bufferInit, int colIdx) {
                 ImGui::PushID(colIdx);
@@ -326,34 +508,8 @@ void DrawBottom() {
                         SetEditBuffer(bufferInit);
                     }
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Double-click to edit");
-
                 if (ImGui::BeginPopupContextItem()) {
                     if (ImGui::MenuItem("Delete")) deleteIdx = i;
-                    if (ImGui::MenuItem("Change Description")) {
-                        g_editState.index = i;
-                        g_editState.field = EditField::Description;
-                        SetEditBuffer(addr.description.c_str());
-                    }
-                    if (ImGui::MenuItem("Change Address")) {
-                        g_editState.index = i;
-                        g_editState.field = EditField::Address;
-                        char tmp[32];
-                        snprintf(tmp, sizeof(tmp), "%lx", addr.address);
-                        SetEditBuffer(tmp);
-                    }
-                    if (ImGui::MenuItem("Change Type")) {
-                        g_editState.index = i;
-                        g_editState.field = EditField::Type;
-                    }
-                    if (ImGui::MenuItem("Change Value")) {
-                        g_editState.index = i;
-                        g_editState.field = EditField::Value;
-                        char tmp[32];
-                        uint32_t currentVal = g_scanner.readMemory<uint32_t>(addr.address);
-                        snprintf(tmp, sizeof(tmp), "%u", currentVal);
-                        SetEditBuffer(tmp);
-                    }
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();
@@ -379,10 +535,6 @@ void DrawBottom() {
             }
             CellItem(valDisplay.c_str(), EditField::Value, valDisplay.c_str(), 4);
 
-            if (addr.active) {
-                uint32_t freezeVal = (uint32_t)std::stoul(g_searchValue);
-                g_scanner.writeMemory<uint32_t>(addr.address, freezeVal);
-            }
             ImGui::PopID();
         }
         if (deleteIdx != -1) {
@@ -396,6 +548,15 @@ void DrawBottom() {
 int main(int, char**) {
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) return 1;
+
+    g_jsEngine = std::make_unique<laugh::JavaScriptEngine>();
+    if (!g_jsEngine->init()) {
+        fprintf(stderr, "Failed to initialize JavaScript engine: %s\n", g_jsEngine->getLastError().c_str());
+    } else {
+        g_jsEngine->setMemoryScanner(&g_scanner);
+        g_jsEngine->setProcessList(&g_processes);
+        strncpy(g_scriptCodeBuffer, DEFAULT_SCRIPT, sizeof(g_scriptCodeBuffer)-1);
+    }
 
     const char* glsl_version = "#version 130";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -419,6 +580,11 @@ int main(int, char**) {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
+        // Update script engine
+        if (g_jsEngine && g_jsEngine->isValid()) {
+            g_jsEngine->triggerUpdate();
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -438,7 +604,8 @@ int main(int, char**) {
         DrawProcessSelector();
         DrawEditPopups();
         DrawSettingsWindow();
-
+        DrawScriptPanel();
+        
         ImGui::End();
 
         ImGui::Render();
@@ -449,7 +616,62 @@ int main(int, char**) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
+        // Handle JS Output Window
+        if (g_jsOutputWindow) {
+            if (glfwWindowShouldClose(g_jsOutputWindow)) {
+                ImGuiContext* main_ctx = ImGui::GetCurrentContext();
+                glfwMakeContextCurrent(g_jsOutputWindow);
+                ImGui::SetCurrentContext(g_jsOutputContext);
+                ImGui_ImplOpenGL3_Shutdown();
+                ImGui_ImplGlfw_Shutdown();
+                ImGui::DestroyContext(g_jsOutputContext);
+                glfwDestroyWindow(g_jsOutputWindow);
+                g_jsOutputWindow = nullptr;
+                g_jsOutputContext = nullptr;
+                glfwMakeContextCurrent(window);
+                ImGui::SetCurrentContext(main_ctx);
+            } else {
+                ImGuiContext* main_ctx = ImGui::GetCurrentContext();
+                glfwMakeContextCurrent(g_jsOutputWindow);
+                ImGui::SetCurrentContext(g_jsOutputContext);
+
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+                ImGui::NewFrame();
+
+                ImGui::SetNextWindowPos(ImVec2(0, 0));
+                ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+                ImGui::Begin("JS Script GUI", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+                if (g_jsEngine && g_jsEngine->isValid()) {
+                    g_jsEngine->triggerGUI();
+                }
+                ImGui::End();
+
+                ImGui::Render();
+                int out_w, out_h;
+                glfwGetFramebufferSize(g_jsOutputWindow, &out_w, &out_h);
+                glViewport(0, 0, out_w, out_h);
+                glClearColor(0.1f, 0.1f, 0.1f, 1.00f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+                glfwSwapBuffers(g_jsOutputWindow);
+
+                // Restore main context
+                glfwMakeContextCurrent(window);
+                ImGui::SetCurrentContext(main_ctx);
+            }
+        }
+
         glfwSwapBuffers(window);
+    }
+
+    if (g_jsOutputWindow) {
+        glfwMakeContextCurrent(g_jsOutputWindow);
+        ImGui::SetCurrentContext(g_jsOutputContext);
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext(g_jsOutputContext);
+        glfwDestroyWindow(g_jsOutputWindow);
     }
 
     ImGui_ImplOpenGL3_Shutdown();

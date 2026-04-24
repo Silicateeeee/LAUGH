@@ -11,7 +11,8 @@ enum class ValueType {
     EightBytes,
     Float,
     Double,
-    String
+    String,
+    AOB
 };
 
 struct MemoryRegion {
@@ -55,6 +56,7 @@ public:
 
     void firstScan(ValueType type, const std::string& valueStr);
     void nextScan(ValueType type, const std::string& valueStr);
+    std::vector<ScanResult> aobScan(const std::string& pattern);
     
     std::vector<ScanResult> getResults() const { 
         std::lock_guard<std::mutex> lock(m_resultsMutex);
