@@ -25,6 +25,10 @@ ProcessInfo g_selectedProcess = {-1, "None", ""};
 bool g_showProcessSelector = false;
 bool g_showSettings = false;
 
+// Global JS window state
+GLFWwindow* g_jsOutputWindow = nullptr;
+ImGuiContext* g_jsOutputContext = nullptr;
+
 std::unique_ptr<laugh::JavaScriptEngine> g_jsEngine;
 bool g_showScriptPanel = false;
 char g_scriptCodeBuffer[32768] = "";
@@ -91,6 +95,27 @@ static void SetEditBuffer(const char* str) {
 
 static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
+
+static void SyncContextSettings(GLFWwindow* targetWin = nullptr) {
+    // Sync ImGui Style to current context
+    if (g_settings.darkMode) ImGui::StyleColorsDark();
+    else ImGui::StyleColorsLight();
+    
+    ImGui::GetIO().FontGlobalScale = g_settings.uiScale;
+    ImGui::GetStyle().FrameRounding = g_settings.rounding;
+
+    // Sync Process info to JS Engine
+    if (g_jsEngine) {
+        g_jsEngine->setAttachedProcess(g_selectedProcess.pid, g_selectedProcess.name);
+    }
+
+    // Sync Window Title if this is the secondary window
+    if (targetWin && targetWin == g_jsOutputWindow) {
+        char title[256];
+        snprintf(title, sizeof(title), "LAUGH Script GUI - %s [%d]", g_selectedProcess.name.c_str(), g_selectedProcess.pid);
+        glfwSetWindowTitle(targetWin, title);
+    }
 }
 
 void DrawProcessSelector() {
@@ -267,14 +292,19 @@ void DrawDocumentation() {
             ImGui::BulletText("type: 0=Byte, 1=2Bytes, 2=4Bytes, 3=8Bytes, 4=Float, 5=Double, 6=String");
             ImGui::Separator();
             ImGui::Text("memory.write(address, value, type)");
-            ImGui::BulletText("value: Number or BigInt");
+            ImGui::BulletText("value: Number, BigInt, or String (for type 7)");
+            ImGui::BulletText("type: 0-6 (Numeric/String), 7 (AOB Pattern)");
             ImGui::Separator();
             ImGui::Text("memory.scan()");
             ImGui::BulletText("Returns an array of BigInt addresses from the last scan results.");
             ImGui::Separator();
             ImGui::Text("memory.AOB(pattern)");
             ImGui::BulletText("pattern: String (e.g., \"00 FA AF ?? 00\")");
-            ImGui::BulletText("Returns an array of BigInt addresses found.");
+            ImGui::BulletText("Returns a Promise resolving to an array of BigInt addresses.");
+            ImGui::Separator();
+            ImGui::Text("memory.isScanning() - Returns true if a background scan is active.");
+            ImGui::Text("memory.getProgress() - Returns 0.0 to 1.0.");
+            ImGui::Text("memory.getResults() - Returns latest results array.");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("GUI")) {
@@ -300,10 +330,6 @@ void DrawDocumentation() {
         ImGui::EndTabBar();
     }
 }
-
-// Global JS window state
-GLFWwindow* g_jsOutputWindow = nullptr;
-ImGuiContext* g_jsOutputContext = nullptr;
 
 void InitJSOutputWindow(const char* glsl_version) {
     if (g_jsOutputWindow) return;
@@ -580,14 +606,15 @@ int main(int, char**) {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // Update script engine
-        if (g_jsEngine && g_jsEngine->isValid()) {
-            g_jsEngine->triggerUpdate();
-        }
-
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        // Sync main window context settings and update engine
+        SyncContextSettings(window);
+        if (g_jsEngine && g_jsEngine->isValid()) {
+            g_jsEngine->triggerUpdate();
+        }
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(io.DisplaySize);
@@ -634,6 +661,9 @@ int main(int, char**) {
                 ImGuiContext* main_ctx = ImGui::GetCurrentContext();
                 glfwMakeContextCurrent(g_jsOutputWindow);
                 ImGui::SetCurrentContext(g_jsOutputContext);
+
+                // Sync style/settings and window title to secondary context
+                SyncContextSettings(g_jsOutputWindow);
 
                 ImGui_ImplOpenGL3_NewFrame();
                 ImGui_ImplGlfw_NewFrame();

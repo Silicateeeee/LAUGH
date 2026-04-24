@@ -64,6 +64,14 @@ public:
     }
     void clearResults();
 
+    struct AOBByte {
+        uint8_t value;
+        bool isWildcard;
+    };
+    static std::vector<AOBByte> parseAOB(const std::string& pattern);
+
+    bool patch(uintptr_t address, const std::string& pattern);
+
 private:
     pid_t m_pid = -1;
     std::vector<ScanResult> m_results;

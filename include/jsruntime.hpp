@@ -30,6 +30,7 @@ public:
 
     void setMemoryScanner(void* scanner);
     void setProcessList(void* processes);
+    void setAttachedProcess(int pid, const std::string& name);
 
     void triggerUpdate();
     void triggerGUI();
@@ -45,9 +46,16 @@ public:
     void clearLogs() { m_logs.clear(); }
     void addLog(ScriptLog::Level level, const std::string& message);
 
+    struct PendingPromise {
+        JSValue resolve;
+        JSValue reject;
+    };
+
 private:
     std::string m_lastError;
     std::vector<ScriptLog> m_logs;
+    std::vector<PendingPromise> m_pendingPromises;
+    bool m_wasScanning = false;
 
     UpdateCallback m_onUpdate;
     std::function<void(const std::string&)> m_errorHandler;
@@ -57,6 +65,8 @@ private:
 
     void* m_memoryScanner = nullptr;
     void* m_processList = nullptr;
+    int m_attachedPid = -1;
+    std::string m_attachedName = "None";
 
     bool m_valid = false;
     static std::atomic<int> s_nextId;
@@ -69,6 +79,9 @@ private:
     static JSValue jsWriteMemory(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
     static JSValue jsScanMemory(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
     static JSValue jsAOBScan(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+    static JSValue jsIsScanning(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+    static JSValue jsGetProgress(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+    static JSValue jsGetResults(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
     static JSValue jsGetProcessInfo(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 
     static JSValue jsWindowBegin(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);

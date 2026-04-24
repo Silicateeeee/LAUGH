@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "mem_scanner.hpp"
 #include <sys/uio.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -87,13 +89,17 @@ ssize_t MemScanner::readRaw(uintptr_t address, void* buffer, size_t size) {
 
 ssize_t MemScanner::writeRaw(uintptr_t address, const void* buffer, size_t size) {
     if (m_pid == -1) return -1;
-    struct iovec local[1];
-    struct iovec remote[1];
-    local[0].iov_base = (void*)buffer;
-    local[0].iov_len = size;
-    remote[0].iov_base = (void*)address;
-    remote[0].iov_len = size;
-    return process_vm_writev(m_pid, local, 1, remote, 1, 0);
+    
+    std::string memPath = "/proc/" + std::to_string(m_pid) + "/mem";
+    int fd = open(memPath.c_str(), O_WRONLY);
+    if (fd == -1) {
+        // Fallback or error
+        return -1;
+    }
+
+    ssize_t written = pwrite(fd, buffer, size, (off_t)address);
+    close(fd);
+    return written;
 }
 
 template<typename T>
@@ -124,12 +130,7 @@ template bool MemScanner::writeMemory<uint64_t>(uintptr_t, uint64_t);
 template bool MemScanner::writeMemory<float>(uintptr_t, float);
 template bool MemScanner::writeMemory<double>(uintptr_t, double);
 
-struct AOBByte {
-    uint8_t value;
-    bool isWildcard;
-};
-
-static std::vector<AOBByte> parseAOB(const std::string& pattern) {
+std::vector<MemScanner::AOBByte> MemScanner::parseAOB(const std::string& pattern) {
     std::vector<AOBByte> bytes;
     std::stringstream ss(pattern);
     std::string hex;
@@ -145,6 +146,20 @@ static std::vector<AOBByte> parseAOB(const std::string& pattern) {
     return bytes;
 }
 
+bool MemScanner::patch(uintptr_t address, const std::string& pattern) {
+    auto aob = parseAOB(pattern);
+    if (aob.empty()) return false;
+    
+    for (size_t i = 0; i < aob.size(); ++i) {
+        if (!aob[i].isWildcard) {
+            if (!writeMemory<uint8_t>(address + i, aob[i].value)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 const size_t CHUNK_SIZE = 1024 * 1024; // 1MB
 
 void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, uint32_t targetVal, float targetFloat, const std::string& targetStr, std::vector<ScanResult>& localResults) {
@@ -153,22 +168,49 @@ void MemScanner::scanRegionChunked(const MemoryRegion& region, ValueType type, u
     if (type == ValueType::AOB) {
         auto aob = parseAOB(targetStr);
         if (aob.empty()) return;
-        
+
+        // Optimization: Find first non-wildcard byte to use memchr
+        size_t firstFixedIdx = 0;
+        while (firstFixedIdx < aob.size() && aob[firstFixedIdx].isWildcard) {
+            firstFixedIdx++;
+        }
+
         std::vector<uint8_t> buffer(CHUNK_SIZE + aob.size());
         for (size_t offset = 0; offset < regionSize; offset += CHUNK_SIZE) {
             size_t bytesToRead = std::min(CHUNK_SIZE, regionSize - offset);
             size_t readSize = std::min(bytesToRead + aob.size() - 1, regionSize - offset);
+            
             if (readRaw(region.start + offset, buffer.data(), readSize) > 0) {
-                for (size_t i = 0; i < bytesToRead; ++i) {
-                    if (i + aob.size() > readSize) break;
-                    bool match = true;
-                    for (size_t j = 0; j < aob.size(); ++j) {
-                        if (!aob[j].isWildcard && buffer[i + j] != aob[j].value) {
-                            match = false;
-                            break;
+                if (firstFixedIdx < aob.size()) {
+                    // Optimized path: use memchr to find first fixed byte
+                    uint8_t firstByte = aob[firstFixedIdx].value;
+                    uint8_t* ptr = buffer.data();
+                    uint8_t* endPtr = buffer.data() + bytesToRead;
+
+                    while (ptr < endPtr) {
+                        uint8_t* candidate = (uint8_t*)std::memchr(ptr, firstByte, endPtr - ptr);
+                        if (!candidate) break;
+
+                        // Calculate potential start of match
+                        intptr_t matchStartIdx = (candidate - buffer.data()) - firstFixedIdx;
+                        if (matchStartIdx >= 0 && (size_t)matchStartIdx + aob.size() <= readSize) {
+                            bool match = true;
+                            for (size_t j = 0; j < aob.size(); ++j) {
+                                if (!aob[j].isWildcard && buffer[matchStartIdx + j] != aob[j].value) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) localResults.push_back({region.start + offset + (size_t)matchStartIdx});
                         }
+                        ptr = candidate + 1;
                     }
-                    if (match) localResults.push_back({region.start + offset + i});
+                } else {
+                    // Fallback for all-wildcard pattern (rare)
+                    for (size_t i = 0; i < bytesToRead; ++i) {
+                        if (i + aob.size() > readSize) break;
+                        localResults.push_back({region.start + offset + i});
+                    }
                 }
             }
         }

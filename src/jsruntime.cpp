@@ -54,6 +54,11 @@ void JavaScriptEngine::setProcessList(void* processes) {
     m_processList = processes;
 }
 
+void JavaScriptEngine::setAttachedProcess(int pid, const std::string& name) {
+    m_attachedPid = pid;
+    m_attachedName = name;
+}
+
 void JavaScriptEngine::addLog(ScriptLog::Level level, const std::string& message) {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
@@ -64,6 +69,20 @@ void JavaScriptEngine::addLog(ScriptLog::Level level, const std::string& message
     if (m_logs.size() > 1000) {
         m_logs.erase(m_logs.begin());
     }
+}
+
+static uint64_t toUint64(JSContext* ctx, JSValueConst val) {
+    uint64_t v = 0;
+    if (JS_IsBigInt(ctx, val)) {
+        int64_t v64 = 0;
+        JS_ToBigInt64(ctx, &v64, val);
+        v = (uint64_t)v64;
+    } else {
+        int64_t v64 = 0;
+        JS_ToInt64(ctx, &v64, val);
+        v = (uint64_t)v64;
+    }
+    return v;
 }
 
 static int32_t toInt32(JSContext* ctx, JSValueConst val) {
@@ -104,6 +123,12 @@ void JavaScriptEngine::setupBindings() {
         JS_NewCFunction(m_ctx, jsScanMemory, "scan", 0), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     JS_DefinePropertyValueStr(m_ctx, memoryObj, "AOB",
         JS_NewCFunction(m_ctx, jsAOBScan, "AOB", 1), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(m_ctx, memoryObj, "isScanning",
+        JS_NewCFunction(m_ctx, jsIsScanning, "isScanning", 0), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(m_ctx, memoryObj, "getProgress",
+        JS_NewCFunction(m_ctx, jsGetProgress, "getProgress", 0), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(m_ctx, memoryObj, "getResults",
+        JS_NewCFunction(m_ctx, jsGetResults, "getResults", 0), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     JS_DefinePropertyValueStr(m_ctx, memoryObj, "getProcessInfo",
         JS_NewCFunction(m_ctx, jsGetProcessInfo, "getProcessInfo", 0), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
 
@@ -148,7 +173,7 @@ JSValue JavaScriptEngine::jsReadMemory(JSContext* ctx, JSValueConst this_val, in
     if (argc < 2) return JS_NULL;
 
     auto ms = static_cast<MemScanner*>(s_current->m_memoryScanner);
-    uint64_t addr = toInt64(ctx, argv[0]);
+    uint64_t addr = toUint64(ctx, argv[0]);
     int type = toInt32(ctx, argv[1]);
 
     switch (type) {
@@ -171,7 +196,7 @@ JSValue JavaScriptEngine::jsWriteMemory(JSContext* ctx, JSValueConst this_val, i
     if (argc < 3) return JS_FALSE;
 
     auto ms = static_cast<MemScanner*>(s_current->m_memoryScanner);
-    uint64_t addr = toInt64(ctx, argv[0]);
+    uint64_t addr = toUint64(ctx, argv[0]);
     int type = toInt32(ctx, argv[2]);
 
     switch (type) {
@@ -181,6 +206,14 @@ JSValue JavaScriptEngine::jsWriteMemory(JSContext* ctx, JSValueConst this_val, i
         case 3: ms->writeMemory<uint64_t>(addr, (uint64_t)toInt64(ctx, argv[1])); break;
         case 4: ms->writeMemory<float>(addr, (float)toFloat64(ctx, argv[1])); break;
         case 5: ms->writeMemory<double>(addr, (double)toFloat64(ctx, argv[1])); break;
+        case 7: { // AOB
+            const char* pattern = JS_ToCString(ctx, argv[1]);
+            if (pattern) {
+                ms->patch(addr, pattern);
+                JS_FreeCString(ctx, pattern);
+            }
+            break;
+        }
         default: return JS_FALSE;
     }
     return JS_TRUE;
@@ -203,15 +236,47 @@ JSValue JavaScriptEngine::jsScanMemory(JSContext* ctx, JSValueConst this_val, in
 }
 
 JSValue JavaScriptEngine::jsAOBScan(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    if (!s_current || !s_current->m_memoryScanner) return JS_NewArray(ctx);
-    if (argc < 1) return JS_NewArray(ctx);
+    if (!s_current || !s_current->m_memoryScanner) return JS_NULL;
+    if (argc < 1) return JS_NULL;
 
     const char* pattern = JS_ToCString(ctx, argv[0]);
-    if (!pattern) return JS_NewArray(ctx);
+    if (!pattern) return JS_NULL;
 
     auto ms = static_cast<MemScanner*>(s_current->m_memoryScanner);
-    auto results = ms->aobScan(pattern);
+    
+    // Check if already scanning
+    if (ms->isScanning()) {
+        JS_FreeCString(ctx, pattern);
+        return JS_ThrowInternalError(ctx, "Scan already in progress");
+    }
+
+    ms->firstScan(ValueType::AOB, pattern);
     JS_FreeCString(ctx, pattern);
+
+    JSValue resolving_funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    
+    s_current->m_pendingPromises.push_back({JS_DupValue(ctx, resolving_funcs[0]), JS_DupValue(ctx, resolving_funcs[1])});
+    
+    return promise;
+}
+
+JSValue JavaScriptEngine::jsIsScanning(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (!s_current || !s_current->m_memoryScanner) return JS_FALSE;
+    auto ms = static_cast<MemScanner*>(s_current->m_memoryScanner);
+    return ms->isScanning() ? JS_TRUE : JS_FALSE;
+}
+
+JSValue JavaScriptEngine::jsGetProgress(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (!s_current || !s_current->m_memoryScanner) return JS_NewFloat64(ctx, 0.0);
+    auto ms = static_cast<MemScanner*>(s_current->m_memoryScanner);
+    return JS_NewFloat64(ctx, ms->getProgress());
+}
+
+JSValue JavaScriptEngine::jsGetResults(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (!s_current || !s_current->m_memoryScanner) return JS_NewArray(ctx);
+    auto ms = static_cast<MemScanner*>(s_current->m_memoryScanner);
+    auto results = ms->getResults();
 
     JSValue arr = JS_NewArray(ctx);
     for (uint32_t i = 0; i < results.size(); ++i) {
@@ -224,9 +289,8 @@ JSValue JavaScriptEngine::jsGetProcessInfo(JSContext* ctx, JSValueConst this_val
     if (!s_current) return JS_NULL;
 
     JSValue obj = JS_NewObject(ctx);
-    // TODO: Implement getting current attached process info
-    JS_SetPropertyStr(ctx, obj, "pid", JS_NewInt32(ctx, 0));
-    JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, "Unknown"));
+    JS_SetPropertyStr(ctx, obj, "pid", JS_NewInt32(ctx, s_current->m_attachedPid));
+    JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, s_current->m_attachedName.c_str()));
     return obj;
 }
 
@@ -468,6 +532,11 @@ bool JavaScriptEngine::execute(const std::string& code) {
 
     JS_FreeValue(m_ctx, val);
     m_lastError.clear();
+
+    // Process promise microtasks
+    JSContext* ctx1;
+    while (JS_ExecutePendingJob(m_rt, &ctx1) > 0);
+
     return true;
 }
 
@@ -475,6 +544,36 @@ void JavaScriptEngine::triggerUpdate() {
     if (!m_ctx || !m_valid) return;
     s_current = this;
     
+    // Check scanner status and resolve promises if finished
+    if (m_memoryScanner) {
+        auto ms = static_cast<MemScanner*>(m_memoryScanner);
+        bool isScanning = ms->isScanning();
+        if (m_wasScanning && !isScanning) {
+            // Scan just finished
+            auto results = ms->getResults();
+            
+            // Create a JS array of the results
+            JSValue resultsArr = JS_NewArray(m_ctx);
+            for (uint32_t i = 0; i < results.size(); ++i) {
+                JS_SetPropertyUint32(m_ctx, resultsArr, i, JS_NewBigUint64(m_ctx, results[i].address));
+            }
+
+            for (auto& promise : m_pendingPromises) {
+                JSValue res = JS_Call(m_ctx, promise.resolve, JS_UNDEFINED, 1, &resultsArr);
+                JS_FreeValue(m_ctx, res);
+                JS_FreeValue(m_ctx, promise.resolve);
+                JS_FreeValue(m_ctx, promise.reject);
+            }
+            m_pendingPromises.clear();
+            JS_FreeValue(m_ctx, resultsArr);
+        }
+        m_wasScanning = isScanning;
+    }
+
+    // Process promise microtasks
+    JSContext* ctx1;
+    while (JS_ExecutePendingJob(m_rt, &ctx1) > 0);
+
     JSValue global = JS_GetGlobalObject(m_ctx);
     JSValue onUpdate = JS_GetPropertyStr(m_ctx, global, "onUpdate");
     if (JS_IsFunction(m_ctx, onUpdate)) {
