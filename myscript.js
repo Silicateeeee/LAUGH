@@ -6,7 +6,7 @@
 
 var camAddr = "NULL";
 var isScanning = false;
-
+key="admin:admin"
 function onUpdate() {
     // Your code here - called every frame
 }
